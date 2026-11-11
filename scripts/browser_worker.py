@@ -26,10 +26,9 @@ import uuid
 LIMIT = 4 * 1024 * 1024
 
 
-class Fault(Exception):
-    def __init__(self, kind, message=''):
-        self.kind = kind
-        super().__init__(message or kind)
+# The feature binary prefixes the private CDP source; standalone tests import it.
+if 'CDP' not in globals():
+    from browser_cdp import CDP, Fault
 
 
 def workspace(value):
@@ -82,102 +81,6 @@ class Lease:
             raise Fault('stale_generation', 'discard pending work from previous controller')
 
 
-class CDP:
-    def __init__(self, read, write):
-        self.read, self.write = read, write
-        self.counter = 0
-        self.lock = threading.Lock()
-        self.pending = {}
-        self.closed = False
-        self.authorize = contextlib.nullcontext
-        self.fds_closed = False
-        self.thread = threading.Thread(target=self.receive, daemon=True)
-        self.thread.start()
-
-    def receive(self):
-        buf = bytearray()
-        dropping = False
-        try:
-            while True:
-                chunk = os.read(self.read, 65536)
-                if not chunk:
-                    break
-                parts = chunk.split(b'\0')
-                for index, part in enumerate(parts):
-                    if not dropping and len(buf) + len(part) > 16 * 1024 * 1024:
-                        # A noisy page can produce a huge incompressible PNG.
-                        # Drain this WHOLE CDP message without retaining it, not
-                        # a broken pipe/session or an unbounded allocation.
-                        match = re.search(rb'"id"\s*:\s*(\d+)', buf[:512])
-                        with self.lock:
-                            waiter = self.pending.get(int(match[1])) if match else None
-                        if waiter:
-                            waiter.put_nowait({'error': {'message': 'CDP response exceeds 16MiB; reduce viewport'}})
-                        buf.clear()
-                        dropping = True
-                    if not dropping:
-                        buf.extend(part)
-                    if index == len(parts) - 1:
-                        continue
-                    if dropping:
-                        dropping = False
-                        continue
-                    msg = json.loads(buf)
-                    buf.clear()
-                    with self.lock:
-                        waiter = self.pending.get(msg.get('id'))
-                    if waiter:
-                        waiter.put_nowait(msg)
-                    # No event consumer exists in pull revision2. The genuine
-                    # frontend has its own native host session; discard unrelated
-                    # CDP events rather than retaining a diagnostic image queue.
-        except (OSError, ValueError):
-            pass
-        finally:
-            self.closed = True
-            with self.lock:
-                for waiter in self.pending.values():
-                    try:
-                        waiter.put_nowait({'error': {'message': 'Chromium pipe closed; inspect chromium.stderr'}})
-                    except queue.Full:
-                        pass
-
-    def close(self):
-        with self.lock:
-            if self.fds_closed:
-                return
-            self.fds_closed = True
-            self.closed = True
-        os.close(self.write)
-        self.thread.join(timeout=1)
-        os.close(self.read)
-
-    def call(self, method, params=None, session=None, timeout=5):
-        answer = queue.Queue(maxsize=1)
-        with self.authorize(), self.lock:
-            if self.closed:
-                raise Fault('browser_failed', 'Chromium pipe closed')
-            self.counter += 1
-            ident = self.counter
-            self.pending[ident] = answer
-            msg = {'id': ident, 'method': method, 'params': params or {}}
-            if session:
-                msg['sessionId'] = session
-            data = json.dumps(msg, separators=(',', ':')).encode() + b'\0'
-            while data:
-                data = data[os.write(self.write, data):]
-        try:
-            result = answer.get(timeout=timeout)
-            if 'error' in result:
-                raise Fault('browser_failed', str(result['error']))
-            return result.get('result', {})
-        except queue.Empty:
-            raise Fault('browser_failed', 'Chromium command timed out: ' + method)
-        finally:
-            with self.lock:
-                self.pending.pop(ident, None)
-
-
 class Browser:
     def __init__(self, root, executable):
         self.root = root
@@ -185,6 +88,7 @@ class Browser:
         self.lease = Lease()
         self.state_lock = threading.RLock()
         self.local = threading.local()
+        self.input_receipts, self.input_errors = {}, []
         self.sessions, self.tools, self.sizes, self.sequences = {}, {}, {}, {}
         self.selected = None
         self.revision = 0
@@ -405,6 +309,65 @@ class Browser:
                 pass
         self.tools.clear()
         self.sequences.clear()
+        self.discard_inputs()
+
+    def discard_inputs(self):
+        with self.state_lock:
+            for ident in self.input_receipts:
+                self.cdp.forget(ident)
+            self.input_receipts.clear()
+            self.input_errors.clear()
+
+    def reap_inputs(self, now=None):
+        with self.state_lock:
+            now = time.monotonic() if now is None else now
+            for ident, receipt in list(self.input_receipts.items()):
+                kind = 'cdp_error'
+                try:
+                    response = receipt['answer'].get_nowait()
+                except queue.Empty:
+                    if now < receipt['deadline']:
+                        continue
+                    kind = 'timeout'
+                    response = {'error': {'message': 'input ACK exceeded 30s; execution/effect unknown'}}
+                self.input_receipts.pop(ident)
+                self.cdp.forget(ident)
+                if 'error' in response:
+                    self.input_errors.append({'owner': receipt['owner'], 'generation': receipt['generation'],
+                        'receipt': ident, 'kind': kind, 'message': str(response['error'])[:1024]})
+
+    def heartbeat_receipts(self, identity, generation):
+        with self.state_lock:
+            self.lease.check(identity, generation)
+            self.reap_inputs()
+            errors = [{k: error[k] for k in ('receipt', 'kind', 'message')}
+                      for error in self.input_errors
+                      if error['owner'] == identity and error['generation'] == generation]
+            self.input_errors.clear()
+            return {'input_pending': len(self.input_receipts), 'input_errors': errors}
+
+    def input_command(self, method, params, session):
+        # Only input can await paused JS while its frontend must stay usable.
+        # Record truthful pending ACKs, never silently turn timeout into success.
+        with self.state_lock:
+            self.lease.check(self.local.identity, self.local.generation)
+            self.reap_inputs()
+            if len(self.input_receipts) + len(self.input_errors) >= 64:
+                raise Fault('slow_consumer', '64 unconsumed input receipts/errors; heartbeat to drain')
+            ident, answer = self.cdp.begin(method, params, session, compact=True)
+            self.input_receipts[ident] = {'owner': self.local.identity, 'generation': self.local.generation,
+                'deadline': time.monotonic() + 30, 'answer': answer}
+        try:
+            response = answer.get(timeout=.05)
+        except queue.Empty:
+            return {'accepted': True, 'pending': True, 'receipt': ident}
+        with self.state_lock:
+            self.lease.check(self.local.identity, self.local.generation)
+            self.input_receipts.pop(ident, None)
+            self.cdp.forget(ident)
+            if 'error' in response:
+                raise Fault('browser_failed', str(response['error']))
+        return {'accepted': True, 'pending': False, 'receipt': ident}
 
     def input(self, ident, event):
         session = self.session(ident)
@@ -425,12 +388,12 @@ class Browser:
                 if action is None or event.get('button') not in ('none', 'left', 'middle', 'right'):
                     raise Fault('invalid_params', 'invalid pointer action')
                 params.update(type=action, button=event['button'], buttons=event.get('buttons', 0), clickCount=event.get('click_count', 1))
-            self.cdp.call('Input.dispatchMouseEvent', params, session)
+            return self.input_command('Input.dispatchMouseEvent', params, session)
         elif kind == 'text':
             text = event.get('text')
             if not isinstance(text, str) or len(text.encode()) > 65536:
                 raise Fault('invalid_params', 'text too large')
-            self.cdp.call('Input.insertText', {'text': text}, session)
+            return self.input_command('Input.insertText', {'text': text}, session)
         elif kind == 'key':
             key, code = event.get('key', ''), event.get('code', '')
             if any(not isinstance(v, str) or len(v.encode()) > 128 for v in [key, code]):
@@ -451,7 +414,7 @@ class Browser:
                       'autoRepeat': bool(event.get('repeat', False)), 'windowsVirtualKeyCode': vk}
             if action == 'keyDown' and key == 'Enter':
                 params['text'] = '\r'
-            self.cdp.call('Input.dispatchKeyEvent', params, session)
+            return self.input_command('Input.dispatchKeyEvent', params, session)
         else:
             raise Fault('invalid_params', 'unsupported input event')
 
@@ -509,7 +472,7 @@ class Worker:
             with b.state_lock:
                 b.lease.check(identity, p.get('generation'))
                 b.lease.until = time.monotonic() + 30
-                return {'lease_ms': 30000}
+                return {'lease_ms': 30000, **b.heartbeat_receipts(identity, p.get('generation'))}
         if method == 'browser.release':
             b.revoke()
             return {'released': True}
@@ -530,8 +493,7 @@ class Worker:
                 b.sizes[ident] = (width, height, scale)
                 return {'width': width, 'height': height, 'scale': scale}
             if method == 'browser.input':
-                b.input(ident, p.get('event', {}))
-                return {'accepted': True}
+                return b.input(ident, p.get('event', {}))
             old = b.sequences.get(ident, 0)
             if p.get('ack', 0) != old:
                 raise Fault('invalid_params', 'frame requires exact previous consumed sequence ACK')

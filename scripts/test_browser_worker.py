@@ -4,6 +4,8 @@ import unittest
 import threading
 import os
 import json
+import queue
+import time
 
 spec = importlib.util.spec_from_file_location('worker', Path(__file__).with_name('browser_worker.py'))
 w = importlib.util.module_from_spec(spec)
@@ -118,6 +120,80 @@ class Policy(unittest.TestCase):
             with self.assertRaises(w.Fault):
                 w.navigation(url)
         self.assertEqual(w.navigation('http://localhost:8000/'), 'http://localhost:8000/')
+
+
+class InputReceipts(unittest.TestCase):
+    def browser(self):
+        class Transport:
+            def __init__(self):
+                self.pending = {}
+                self.next = 0
+                self.reply = None
+            def begin(self, *args, **kwargs):
+                self.next += 1
+                answer = queue.Queue(1)
+                self.pending[self.next] = answer
+                if self.reply is not None:
+                    answer.put(self.reply)
+                return self.next, answer
+            def forget(self, ident):
+                self.pending.pop(ident, None)
+        b = w.Browser.__new__(w.Browser)
+        b.state_lock = threading.RLock()
+        b.lease = w.Lease()
+        generation = b.lease.acquire('a', False, False)
+        b.local = threading.local()
+        b.local.identity, b.local.generation = 'a', generation
+        b.input_receipts, b.input_errors = {}, []
+        b.cdp = Transport()
+        return b, generation
+
+    def test_late_error_visible_once_only_to_original_current_controller(self):
+        b, generation = self.browser()
+        result = b.input_command('Input.dispatchMouseEvent', {}, 'session')
+        self.assertTrue(result['pending'])
+        b.cdp.pending[result['receipt']].put({'error': {'message': 'late rejection'}})
+        with self.assertRaises(w.Fault):
+            b.heartbeat_receipts('other', generation)
+        status = b.heartbeat_receipts('a', generation)
+        self.assertEqual(status['input_errors'][0]['kind'], 'cdp_error')
+        self.assertIn('late rejection', status['input_errors'][0]['message'])
+        self.assertEqual(status['input_pending'], 0)
+        self.assertEqual(b.heartbeat_receipts('a', generation)['input_errors'], [])
+
+    def test_immediate_ack_error_is_not_reported_as_accepted(self):
+        b, _ = self.browser()
+        b.cdp.reply = {'error': {'message': 'invalid input'}}
+        with self.assertRaisesRegex(w.Fault, 'invalid input'):
+            b.input_command('Input.dispatchKeyEvent', {}, 'session')
+        self.assertEqual(b.input_receipts, {})
+
+    def test_revocation_discards_pending_receipts_before_replacement_owner(self):
+        b, old = self.browser()
+        result = b.input_command('Input.dispatchMouseEvent', {}, 'session')
+        answer = b.cdp.pending[result['receipt']]
+        b.discard_inputs()
+        new = b.lease.acquire('b', True, True)
+        self.assertNotEqual(new, old)
+        answer.put({'error': {'message': 'old-owner secret error'}})
+        self.assertEqual(b.heartbeat_receipts('b', new), {'input_pending': 0, 'input_errors': []})
+
+    def test_receipt_capacity_and_timeout_do_not_silently_drop_errors(self):
+        b, generation = self.browser()
+        now = time.monotonic()
+        for ident in range(64):
+            answer = queue.Queue(1)
+            b.cdp.pending[ident] = answer
+            b.input_receipts[ident] = {'owner': 'a', 'generation': generation,
+                'deadline': now - 1, 'answer': answer}
+        b.reap_inputs(now)
+        self.assertEqual(len(b.input_errors), 64)
+        with self.assertRaises(w.Fault):
+            b.input_command('Input.dispatchKeyEvent', {}, 'session')
+        errors = b.heartbeat_receipts('a', generation)['input_errors']
+        self.assertEqual(len(errors), 64)
+        self.assertTrue(all(error['kind'] == 'timeout' for error in errors))
+        self.assertEqual(b.input_errors, [])
 
 
 if __name__ == '__main__':

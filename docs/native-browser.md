@@ -32,6 +32,8 @@ python3 -m unittest discover -s scripts -p 'test_browser*.py' -v
 python3 scripts/browser_transport_smoke.py
 python3 scripts/browser_worker_smoke.py
 python3 scripts/browser_security_smoke.py
+python3 scripts/browser_startup_smoke.py
+python3 scripts/browser_debugger_input_smoke.py
 ```
 
 All browser IPC uses a dedicated framed native connection on the existing private
@@ -83,8 +85,17 @@ only after observed exit and no matching owned Chrome descendants.
   replies <=4MiB; physical sides <=4096, pixels <=16,777,216. One frame request
   outstanding per surface, next exact sequence acknowledges consumption. Decode
   clients must validate IHDR before allocating and reject stale generations.
-- Serial broker, per-CDP timeout5s and outer worker timeout20s. Hung/corrupt worker
-  reset can lose live state; no false promise of transparent crash recovery.
+- Serial broker, non-input CDP timeout5s and outer worker timeout20s. Input waits
+  at most50ms for its ACK: `{accepted:true,pending:true,receipt}` reports only an
+  observed authorized write, not completion/effect. This keeps actual pointer-
+  triggered debugger pauses from blocking their frontend step/resume controls.
+  At most64 combined pending receipts and unconsumed errors, ACK deadline30s;
+  heartbeat reports `{input_pending,input_errors:[{receipt,kind,message}]}` to the
+  same current controller/generation. Late errors are not silently converted to
+  success; normal immediate errors remain RPC errors. Revocation discards old
+  receipts before replacement access. Full receipt capacity rejects new input
+  until reaping/heartbeat consumption frees capacity. Hung/corrupt worker reset
+  can lose live state; no false promise of transparent crash recovery.
 - Cancellation checked before broker enqueue and result delivery. Already
   dispatched Chromium actions cannot be undone; cancellation races within a
   multi-CDP operation are not exhaustively verified.

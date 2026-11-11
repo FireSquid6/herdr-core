@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::{sync::Arc, sync::OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+const CDP_SOURCE: &str = include_str!("../../../scripts/browser_cdp.py");
 const WORKER: &str = include_str!("../../../scripts/browser_worker.py");
 const MAX_REPLY: usize = 4 * 1024 * 1024;
 static WORKER_STATE: OnceLock<tokio::sync::Mutex<Option<Worker>>> = OnceLock::new();
@@ -40,8 +41,9 @@ fn identity(conn: &Conn) -> &str {
 impl Worker {
     fn start(core: &Core) -> Result<Self, RpcError> {
         let chrome = std::env::var("HC_BROWSER_CHROME").map_err(|_| unavailable())?;
+        let script = format!("{CDP_SOURCE}\n{WORKER}");
         let mut child = tokio::process::Command::new("python3")
-            .args(["-u", "-c", WORKER])
+            .args(["-u", "-c", &script])
             .arg(core.paths.state.join("browsers"))
             .arg(chrome)
             .stdin(std::process::Stdio::piped())
