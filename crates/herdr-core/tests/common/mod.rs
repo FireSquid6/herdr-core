@@ -16,7 +16,7 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_herdr-core");
 /// (GNU and BSD alike; plain od waits for 16 bytes).
 pub const BYTES: &str = "stty raw -echo; while :; do dd bs=1 count=1 2>/dev/null | od -An -tx1; done";
 
-/// An isolated core: its own HC_SESSION and XDG dirs under /var/tmp.
+/// An isolated core: HC_SESSION/XDG dirs under HC_TEST_ROOT (default /var/tmp).
 pub struct Session {
     pub root: PathBuf,
     pub env: Vec<(String, String)>,
@@ -35,11 +35,12 @@ impl Session {
                 std::thread::sleep(Duration::from_secs(limit));
                 eprintln!("test binary still running after {limit} s: cleaning up and aborting");
                 // Abort skips every Drop, so end this binary's sessions here first.
-                let ours = format!("/var/tmp/hc-test-{}-", std::process::id());
+                let parent = test_root();
+                let ours = parent.join(format!("hc-test-{}-", std::process::id())).display().to_string();
                 for pid in procs_with(&ours) {
                     unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
-                for dir in std::fs::read_dir("/var/tmp").into_iter().flatten().flatten() {
+                for dir in std::fs::read_dir(parent).into_iter().flatten().flatten() {
                     if dir.path().display().to_string().starts_with(&ours) {
                         let _ = std::fs::remove_dir_all(dir.path());
                     }
@@ -47,10 +48,9 @@ impl Session {
                 std::process::abort();
             });
         });
-        let root =
-            PathBuf::from(format!("/var/tmp/hc-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let root = test_root().join(format!("hc-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&root);
-        for dir in ["run", "state", "config"] {
+        for dir in ["run", "state", "config", "tmp"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         // Sends don't wait for fake agents to settle unless a test asks.
@@ -71,6 +71,7 @@ impl Session {
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("TMPDIR", self.root.join("tmp"))
             .envs(self.env.iter().cloned());
         cmd
     }
@@ -160,7 +161,7 @@ impl Drop for Session {
             let test = std::thread::current().name().unwrap_or("?").to_string();
             let note = format!("LEAK in {test}: pid {pid} ({}) still running after server stop\n", cmdline.trim());
             eprint!("{note}");
-            let log = std::fs::OpenOptions::new().create(true).append(true).open("/var/tmp/hc-test-leaks.log");
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(test_root().join("hc-test-leaks.log"));
             let _ = log.and_then(|mut f| f.write_all(note.as_bytes()));
             unsafe { libc::kill(pid, libc::SIGKILL) };
             leaks.push(note);
@@ -172,6 +173,10 @@ impl Drop for Session {
             panic!("processes outlived server stop:\n{}", leaks.concat());
         }
     }
+}
+
+fn test_root() -> PathBuf {
+    std::env::var_os("HC_TEST_ROOT").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or("/var/tmp".into())
 }
 
 /// Reads plain-mode messages until one matches.

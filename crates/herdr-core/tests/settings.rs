@@ -36,15 +36,18 @@ fn headless_size_and_history_come_from_config() {
 
 #[test]
 fn long_session_names_fit_in_a_socket_path_or_say_so() {
-    // macOS allows 104 bytes for a socket path; the session name is in it twice.
+    // Fill the socket budget, including the holder's ".holder.<8 hex>.sock".
+    // The scratch parent is configurable and may be longer than /var/tmp.
     let mut s = Session::new();
-    s.env.push(("HC_SESSION".into(), "a".repeat(40)));
+    let budget = herdr_core::platform::MAX_SOCKET_PATH - s.root.join("run/herdr-core").as_os_str().len() - 22;
+    s.env.push(("HC_SESSION".into(), "a".repeat(budget)));
     let t = run(&s, &["sleep", "100"]);
     assert_eq!(s.json(&["get", &t])["state"], "live");
     s.hc(&["server", "stop"]);
 
     let mut s = Session::new();
-    s.env.push(("HC_SESSION".into(), "a".repeat(70)));
+    let budget = herdr_core::platform::MAX_SOCKET_PATH - s.root.join("run/herdr-core").as_os_str().len() - 22;
+    s.env.push(("HC_SESSION".into(), "a".repeat(budget + 1)));
     let (code, err) = s.err(&["--json", "ls"]);
     assert_ne!(code, 0);
     assert!(err.to_string().contains("too long"), "{err}");
