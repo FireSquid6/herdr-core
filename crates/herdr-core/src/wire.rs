@@ -116,6 +116,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for Watched<'_, R> {
 /// A framed connection as the rest of the core sees it: queue frames, wake the writer.
 #[derive(Default)]
 pub struct Conn {
+    pub(crate) browser_identity: std::sync::OnceLock<String>,
+    pub(crate) browser_admitted: std::sync::atomic::AtomicBool,
+    pub(crate) browser_closed: std::sync::atomic::AtomicBool,
+    pub(crate) browser_pending: std::sync::atomic::AtomicU32,
     outbox: std::sync::Mutex<Outbox>,
     pub wake: tokio::sync::Notify,
     /// It fell too far behind (`MAX_CONTROL`): the connection must end.

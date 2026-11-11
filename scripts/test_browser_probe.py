@@ -26,6 +26,25 @@ class ProbeSafety(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), "keep")
             self.assertEqual(run.stat().st_mode & 0o777, 0o700)
 
+    def test_sandbox_status_accepts_legacy_and_current_chromium_with_both_layers(self):
+        legacy = "Namespace Sandbox\tYes\nSeccomp-BPF sandbox\tYes\n"
+        current = (
+            "Layer 1 Sandbox\tNamespace\nPID namespaces\tYes\n"
+            "Network namespaces\tYes\nSeccomp-BPF sandbox\tYes\n"
+        )
+        for text in [legacy, current, "SUID Sandbox\tYes\nSeccomp-BPF sandbox\tYes\n"]:
+            with self.subTest(text=text):
+                self.assertTrue(probe.sandbox_enabled(text))
+        for text in [
+            "", legacy.replace("sandbox\tYes", "sandbox\tNo"),
+            current.replace("PID namespaces\tYes", "PID namespaces\tNo"),
+            current.replace("Network namespaces\tYes", "Network namespaces\tNo"),
+            current.replace("Layer 1 Sandbox\tNamespace", "Layer 1 Sandbox\tNone"),
+            "Seccomp-BPF sandbox\tYes\n", "You are adequately sandboxed.",
+        ]:
+            with self.subTest(text=text):
+                self.assertFalse(probe.sandbox_enabled(text))
+
     def test_launch_uses_private_pipe_and_keeps_chromium_sandbox(self):
         args = probe.launch_args(Path("/private/profile"))
         self.assertIn("--remote-debugging-pipe", args)

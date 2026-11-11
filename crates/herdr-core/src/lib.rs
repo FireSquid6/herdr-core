@@ -16,6 +16,7 @@ mod kept;
 pub mod keys;
 pub mod locale;
 pub mod machines;
+mod native_browser;
 pub mod notes;
 pub mod paths;
 pub mod picker;

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import re
 import select
 import shutil
 import signal
@@ -28,6 +29,20 @@ def launch_args(profile):
         "--no-default-browser-check",
         "about:blank",
     ]
+
+
+def sandbox_enabled(text):
+    """Require layer-1 isolation and Seccomp, including Chromium's newer table."""
+    def row(pattern):
+        return re.search(pattern, text, re.IGNORECASE | re.MULTILINE) is not None
+
+    legacy = row(r"^(?:Namespace|SUID) Sandbox[\t ]+Yes[\t ]*$")
+    namespace = (
+        row(r"^Layer 1 Sandbox[\t ]+Namespace[\t ]*$")
+        and row(r"^PID namespaces[\t ]+Yes[\t ]*$")
+        and row(r"^Network namespaces[\t ]+Yes[\t ]*$")
+    )
+    return (legacy or namespace) and row(r"^Seccomp-BPF sandbox[\t ]+Yes[\t ]*$")
 
 
 def private_processes(private):
@@ -156,10 +171,7 @@ def run(browser, scratch, timeout=15):
                 break
             time.sleep(0.05)
         (directory / "sandbox.txt").write_text(text)
-        import re
-        namespace = re.search(r"(?:Namespace|SUID) Sandbox\s+Yes", text, re.IGNORECASE)
-        seccomp = re.search(r"Seccomp-BPF sandbox\s+Yes", text, re.IGNORECASE)
-        if not namespace or not seccomp:
+        if not sandbox_enabled(text):
             raise RuntimeError("chrome://sandbox did not prove both isolation and Seccomp-BPF; see sandbox.txt")
         report["sandbox"] = "PASS"
         (directory / "browser.status").write_text(Path(f"/proc/{pid}/status").read_text())

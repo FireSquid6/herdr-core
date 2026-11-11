@@ -241,6 +241,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
             Ok(())
         }
     };
+    crate::native_browser::disconnect(&conn).await;
     core.detach(&conn, None);
     crate::remote::conn_gone(&core, &conn);
     crate::remote::peer_left(&core, &conn);
@@ -423,7 +424,8 @@ pub(crate) struct Sends(Vec<(String, std::sync::Weak<std::sync::atomic::AtomicBo
 impl Sends {
     pub(crate) fn track(&mut self, request: &Value) -> Arc<std::sync::atomic::AtomicBool> {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if request["method"] == "terminal.send" {
+        if request["method"] == "terminal.send" || request["method"].as_str().is_some_and(|m| m.starts_with("browser."))
+        {
             self.0.retain(|(_, flag)| flag.strong_count() > 0);
             self.0.push((request["id"].to_string(), Arc::downgrade(&cancelled)));
         }
@@ -490,6 +492,7 @@ async fn handle(
     let call = api::Call { core, conn, plain };
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
     let result = match crate::remote::route(core, method, &params) {
+        _ if method.starts_with("browser.") => crate::native_browser::dispatch(core, conn, method, params).await,
         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
         Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {
             Some(conn) => crate::remote::attach(core, conn, &machine, params).await,
