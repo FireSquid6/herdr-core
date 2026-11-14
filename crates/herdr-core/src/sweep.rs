@@ -211,7 +211,10 @@ mod tests {
     #[test]
     fn a_process_older_than_its_token_is_never_read() {
         // A process older than the token cannot carry it, so its environment need not be read.
-        let later = now() * 2 + 1_000_000;
+        // A guessed offset from now() can precede process starts after suspend:
+        // now() uses the lower clock, while Linux process starts include suspend.
+        // Use the maximum stamp so this fixture needs no uptime/clock assumption.
+        let later = u64::MAX;
         let (tokens, found) = ([format!("{later}-{}", crate::platform::random_hex())], [token()]);
         let mut sleeper = python("import time; time.sleep(30)").env(VAR, &tokens[0]).spawn().unwrap();
         let mut seen = python("import time; time.sleep(30)").env(VAR, &found[0]).spawn().unwrap();
