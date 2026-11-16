@@ -29,10 +29,10 @@ gate. Full runtime implementation must not proceed on an unproven rendering path
   Cleanup failure preserves the live profile and reports FAIL; unrelated paths
   and processes are never removed/signalled. Its safety tests are not browser
   acceptance tests.
-- Existing real-core/PTY test sessions support `HC_TEST_ROOT` (default remains
-  `/var/tmp`) and use a private per-session TMPDIR. Use a short absolute path to
-  stay within Unix socket path limits. Keep the parent private and owned by the
-  testing account. No test points at a live core.
+- Existing real-core/PTY test sessions support `HC_TEST_TMPDIR`, with `HC_TEST_ROOT`
+  as a fallback (default remains `/var/tmp`), and use a private per-session TMPDIR.
+  Use a short absolute path to stay within Unix socket path limits. Keep the parent
+  private and owned by the testing account. No test points at a live core.
 
 ## Reproduce without production installation
 

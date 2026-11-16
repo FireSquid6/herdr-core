@@ -99,6 +99,27 @@ fn strip(bytes: &[u8]) -> String {
     out
 }
 
+/// A wait's subscription and output watch, gone with it however it returns.
+struct Registered<'a> {
+    core: &'a Core,
+    id: u32,
+    events: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    output: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        let mut st = self.core.lock();
+        self.core.unsubscribe_waiter(&mut st, &self.events);
+        if let Some(watchers) = st.output_watch.get_mut(&self.id) {
+            watchers.retain(|w| !w.same_channel(&self.output));
+            if watchers.is_empty() {
+                st.output_watch.remove(&self.id);
+            }
+        }
+    }
+}
+
 impl Core {
     /// A wait's answer from the terminal's current facts; `word` overrides its status.
     pub fn wait_result(&self, id: u32, ended: bool, reason: &str, word: Option<Option<String>>) -> WaitResult {
@@ -127,13 +148,14 @@ impl Core {
             self.subscribe(
                 &mut st,
                 Filter { terminal: Some(crate::terminals::address(id)), ..Default::default() },
-                Sink::Waiter(tx),
+                Sink::Waiter(tx.clone()),
             );
             if spec.output.is_some() {
-                st.output_watch.entry(id).or_default().push(out_tx);
+                st.output_watch.entry(id).or_default().push(out_tx.clone());
             }
             st.reg.terminals.get(&id).cloned()
         };
+        let _registered = Registered { core: self, id, events: tx, output: out_tx };
         let result =
             |ended: bool, reason: &str, word: Option<Option<String>>| self.wait_result(id, ended, reason, word);
         let Some(start) = start.filter(|t| t.is_live() && !t.program_lost()) else {
@@ -171,7 +193,10 @@ impl Core {
                         Some("status") => {
                             let new = event["data"]["status"]["state"].as_str().map(String::from);
                             let stop = if spec.output.is_some() { stuck(new.as_deref()) } else { ends(prev.as_deref(), new.as_deref()) };
-                            if stop {
+                            // A finish clears the status just before it says how the program
+                            // ended: that is an exit, and its finished or lost event follows.
+                            let gone = || !self.lock().reg.terminals.get(&id).is_some_and(|t| t.is_live() && !t.program_lost());
+                            if stop && !(new.is_none() && gone()) {
                                 return result(true, "status", Some(new));
                             }
                             prev = new;
