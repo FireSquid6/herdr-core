@@ -8,8 +8,15 @@ use std::{sync::Arc, sync::OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const CDP_SOURCE: &str = include_str!("../../../scripts/browser_cdp.py");
+const FOCUS_SOURCE: &str = include_str!("../../../scripts/browser_focus.py");
+const EDIT_SOURCE: &str = include_str!("../../../scripts/browser_edit.py");
+const CONTEXT_SOURCE: &str = include_str!("../../../scripts/browser_context.py");
+const GROUPS_SOURCE: &str = include_str!("../../../scripts/browser_groups.py");
 const WORKER: &str = include_str!("../../../scripts/browser_worker.py");
 const MAX_REPLY: usize = 4 * 1024 * 1024;
+// 64KiB plaintext may require six JSON bytes per control byte, plus the
+// bounded command envelope. Keep in sync with the worker's input-line bound.
+const MAX_REQUEST: usize = 512 * 1024;
 static WORKER_STATE: OnceLock<tokio::sync::Mutex<Option<Worker>>> = OnceLock::new();
 
 struct Pending<'a>(&'a std::sync::atomic::AtomicU32);
@@ -41,7 +48,8 @@ fn identity(conn: &Conn) -> &str {
 impl Worker {
     fn start(core: &Core) -> Result<Self, RpcError> {
         let chrome = std::env::var("HC_BROWSER_CHROME").map_err(|_| unavailable())?;
-        let script = format!("{CDP_SOURCE}\n{WORKER}");
+        let script =
+            format!("{CDP_SOURCE}\n{FOCUS_SOURCE}\n{EDIT_SOURCE}\n{CONTEXT_SOURCE}\n{GROUPS_SOURCE}\n{WORKER}");
         let mut child = tokio::process::Command::new("python3")
             .args(["-u", "-c", &script])
             .arg(core.paths.state.join("browsers"))
@@ -62,8 +70,8 @@ impl Worker {
     async fn call(&mut self, id: &str, method: &str, params: Value) -> Result<Value, RpcError> {
         let message = json!({"identity": id, "method": method, "params": params});
         let mut bytes = serde_json::to_vec(&message).map_err(io_error)?;
-        if bytes.len() > 131_000 {
-            return Err(RpcError::invalid_params("browser request exceeds 128KiB"));
+        if bytes.len() > MAX_REQUEST {
+            return Err(RpcError::invalid_params("browser request exceeds 512KiB"));
         }
         bytes.push(b'\n');
         self.input.write_all(&bytes).await.map_err(io_error)?;
@@ -133,7 +141,7 @@ pub async fn dispatch(core: &Core, conn: Option<&Arc<Conn>>, method: &str, param
         }
         conn.browser_admitted.store(true, std::sync::atomic::Ordering::Release);
         return Ok(
-            json!({"revision":2,"capabilities":["page_png","input","devtools_stream"],"lease_ms":30000,"max_frame_bytes":MAX_REPLY}),
+            json!({"revision":2,"capabilities":["page_png","input","devtools_stream","clipboard_text_v1","context_menu_v1","pane_groups_v1"],"lease_ms":30000,"max_frame_bytes":MAX_REPLY}),
         );
     }
     if !conn.browser_admitted.load(std::sync::atomic::Ordering::Acquire) {
@@ -199,5 +207,21 @@ pub async fn disconnect(conn: &Conn) {
     let mut state = state.lock().await;
     if state.is_some() {
         let _ = bounded_call(&mut state, id, "disconnect", json!({})).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_REQUEST;
+    use serde_json::json;
+
+    #[test]
+    fn plaintext_budget_includes_worst_case_json_escaping() {
+        let message = json!({"identity":"owned-pipe", "method":"browser.clipboard", "params":{
+            "workspace":"owned-pipe", "generation":"owned-generation", "target":"owned-target",
+            "operation":"paste", "text":"\u{1}".repeat(65_536)}});
+        let bytes = serde_json::to_vec(&message).unwrap();
+        assert!(bytes.len() > 131_000);
+        assert!(bytes.len() <= MAX_REQUEST);
     }
 }
