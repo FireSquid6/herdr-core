@@ -29,6 +29,12 @@ LIMIT = 4 * 1024 * 1024
 # The feature binary prefixes the private CDP source; standalone tests import it.
 if 'CDP' not in globals():
     from browser_cdp import CDP, Fault
+if 'BrowserEdit' not in globals():
+    from browser_edit import BrowserEdit, validate_clipboard
+if 'context_dispatch' not in globals():
+    from browser_context import context_dispatch, context_event, invalidate_context
+if 'groups_dispatch' not in globals():
+    from browser_groups import groups_dispatch
 
 
 def workspace(value):
@@ -194,10 +200,12 @@ class Browser:
     def tabs(self):
         infos = self.cdp.call('Target.getTargets')['targetInfos']
         tools = {v['id'] for v in self.tools.values()}
+        private_context = getattr(getattr(self, 'edit', None), 'context', None)
         result = [{'id': t['targetId'], 'url': t['url'], 'title': t['title'],
                    **({'opener': t['openerId']} if t.get('openerId') else {})}
                   for t in infos if t['type'] == 'page' and t['targetId'] not in tools
                   and t['targetId'] not in self.internal_targets
+                  and (private_context is None or t.get('browserContextId') != private_context)
                   and not t['url'].startswith(('devtools:', 'chrome:'))]
         if self.selected not in [t['id'] for t in result]:
             self.selected = result[0]['id'] if result else None
@@ -205,6 +213,8 @@ class Browser:
         return {'selected': self.selected, 'tabs': result, 'revision': self.revision}
 
     def session(self, target):
+        if target is not None and target == getattr(getattr(self, 'edit', None), 'target', None):
+            raise Fault('not_found', 'private editing target is not a public page')
         if target not in self.sessions:
             self.sessions[target] = self.cdp.call('Target.attachToTarget', {'targetId': target, 'flatten': True})['sessionId']
         return self.sessions[target]
@@ -299,6 +309,9 @@ class Browser:
             self.lease.owner = None
             self.lease.generation = None
             self.lease.until = 0
+            invalidate_context(self)
+            if hasattr(self, 'edit'):
+                self.edit.invalidate()
             self.close_frontends()
 
     def close_frontends(self):
@@ -451,6 +464,9 @@ class Worker:
                 old = browser.lease.generation
                 generation = browser.lease.acquire(identity, p.get('force') is True, p.get('confirmed') is True)
                 if old != generation:
+                    invalidate_context(browser)
+                    if hasattr(browser, 'edit'):
+                        browser.edit.invalidate()
                     browser.close_frontends()
                 return {'generation': generation, 'lease_ms': 30000}
         with browser.state_lock:
@@ -464,10 +480,34 @@ class Worker:
                 with browser.state_lock:
                     browser.lease.check(identity, generation)
             return result
+        except Fault as error:
+            if ((method == 'browser.clipboard' and p.get('operation') == 'cut'
+                 or method == 'browser.context_action' and p.get('action') == 'cut')
+                    and error.kind in ('not_owner', 'stale_generation')):
+                raise Fault(error.kind, str(error) + '; Cut may already have occurred: do not automatically retry or undo') from None
+            raise
         finally:
             browser.local.active = False
 
     def owned(self, b, identity, method, p):
+        handled, result = groups_dispatch(b, identity, method, p, navigation, invalidate_context)
+        if handled:
+            return result
+        if result is not None:
+            p = result
+        if method in ('browser.context', 'browser.context_action'):
+            result = context_dispatch(b, identity, method, p, navigation)
+            if method == 'browser.context_action' and 'group' in p:
+                result = b.groups.context_created(identity, p, result)
+            return result
+        context_event(b, method, p)
+        if method == 'browser.clipboard':
+            validate_clipboard(p)
+            if p['target'] not in [t['id'] for t in b.tabs()['tabs']]:
+                raise Fault('not_found', 'source page target no longer exists')
+            if not hasattr(b, 'edit'):
+                b.edit = BrowserEdit(b)
+            return b.edit.run(identity, p['generation'], p)
         if method == 'browser.heartbeat':
             with b.state_lock:
                 b.lease.check(identity, p.get('generation'))
@@ -514,6 +554,9 @@ class Worker:
             if p.get('confirmed') is not True:
                 raise Fault('invalid_params', 'stop requires explicit confirmation')
             b.revoke()
+            if hasattr(b, 'edit'):
+                with contextlib.suppress(Exception):
+                    b.edit.close()  # Browser.close remains the final cleanup if CDP disposal fails.
             b.cdp.call('Browser.close')
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -567,8 +610,11 @@ def main():
     if os.geteuid() == 0:
         raise RuntimeError('Chromium worker must not run as root')
     worker = Worker(sys.argv[1], sys.argv[2])
-    while line := sys.stdin.buffer.readline(131073):
-        if len(line) > 131072 or not line.endswith(b'\n'):
+    # Match native_browser.rs: allow worst-case JSON escaping of 64KiB
+    # plaintext plus its envelope, without permitting unbounded input lines.
+    max_request = 512 * 1024
+    while line := sys.stdin.buffer.readline(max_request + 2):
+        if len(line) > max_request + 1 or not line.endswith(b'\n'):
             break
         try:
             request = json.loads(line)
@@ -587,6 +633,9 @@ def main():
     for browser in worker.browsers.values():
         if browser.running:
             try:
+                if hasattr(browser, 'edit'):
+                    with contextlib.suppress(Exception):
+                        browser.edit.close()
                 browser.cdp.call('Browser.close')
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
